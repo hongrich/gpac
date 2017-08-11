@@ -36,6 +36,13 @@
 #error "Cannot compile MP42TS if GPAC is not built with ISO File Format support"
 #endif
 
+#define GPAC_DISABLE_ISOM_WRITE
+
+#define PCR_MS 100
+#define PSI_REFRESH_RATE GF_M2TS_PSI_DEFAULT_REFRESH_RATE
+#define PROG_PCR_OFFSET 0
+#define STARTING_PID 100
+
 static GFINLINE void usage()
 {
 	fprintf(stderr, "GPAC version " GPAC_FULL_VERSION "\n"
@@ -69,8 +76,6 @@ typedef struct
 	GF_ISOFile *mp4;
 	u32 nb_streams, pcr_idx;
 	GF_ESInterface streams[40];
-	u64 samples_done, samples_count;
-	u32 nb_real_streams;
 } M2TSSource;
 
 typedef struct
@@ -125,16 +130,9 @@ static GF_Err mp4_input_ctrl(GF_ESInterface *ifce, u32 act_type, void *param)
 		gf_isom_sample_del(&priv->sample);
 		priv->sample_number++;
 
-		priv->source->samples_done++;
-		gf_set_progress("Converting to MPEG-2 TS", priv->source->samples_done, priv->source->samples_count);
-
 		if (priv->sample_number==priv->sample_count) {
 			if (!(ifce->caps & GF_ESI_STREAM_IS_OVER)) {
 				ifce->caps |= GF_ESI_STREAM_IS_OVER;
-				if (priv->sample_count>1) {
-					assert(priv->source->nb_real_streams);
-					priv->source->nb_real_streams--;
-				}
 			}
 		}
 	}
@@ -170,9 +168,6 @@ static void fill_isom_es_ifce(M2TSSource *source, GF_ESInterface *ifce, GF_ISOFi
 	priv->mp4 = mp4;
 	priv->track = track_num;
 	priv->sample_count = gf_isom_get_sample_count(mp4, track_num);
-	source->samples_count += priv->sample_count;
-	if (priv->sample_count>1)
-		source->nb_real_streams++;
 
 	priv->source = source;
 	memset(ifce, 0, sizeof(GF_ESInterface));
@@ -230,25 +225,6 @@ static void fill_isom_es_ifce(M2TSSource *source, GF_ESInterface *ifce, GF_ISOFi
 	ifce->bit_rate = (u32) avg_rate;
 	ifce->duration = (Double) (s64) gf_isom_get_media_duration(mp4, track_num);
 	ifce->duration /= ifce->timescale;
-
-	GF_SAFEALLOC(ifce->sl_config, GF_SLConfig);
-	if (!ifce->sl_config) {
-		return;
-	}
-	
-	ifce->sl_config->tag = GF_ODF_SLC_TAG;
-	ifce->sl_config->useAccessUnitStartFlag = 1;
-	ifce->sl_config->useAccessUnitEndFlag = 1;
-	ifce->sl_config->useRandomAccessPointFlag = 1;
-	ifce->sl_config->useTimestampsFlag = 1;
-	ifce->sl_config->timestampLength = 33;
-	ifce->sl_config->timestampResolution = ifce->timescale;
-
-#ifdef GPAC_DISABLE_ISOM_WRITE
-	fprintf(stderr, "Warning: GPAC was compiled without ISOM Write support, can't set SL Config!\n");
-#else
-	gf_isom_set_extraction_slc(mp4, track_num, 1, ifce->sl_config);
-#endif
 
 	ifce->input_ctrl = mp4_input_ctrl;
 	if (priv != ifce->input_udta) {
@@ -444,23 +420,12 @@ int main(int argc, char **argv)
 	/*   declarations   */
 	/********************/
 	const char *ts_pck;
-	u32 usec_till_next;
-	u32 j, cur_pid, psi_refresh_rate, pcr_ms;
+	u32 j;
 	char *mp4_in = NULL;
 	char *ts_out = NULL;
 	FILE *ts_output_file = NULL;
 	M2TSSource source;
-	GF_M2TS_Mux *muxer;
-
-	/***********************/
-	/*   initialisations   */
-	/***********************/
-	mp4_in = NULL;
-	ts_output_file = NULL;
-	ts_out = NULL;
-	pcr_ms = 100;
-	muxer = NULL;
-	psi_refresh_rate = GF_M2TS_PSI_DEFAULT_REFRESH_RATE;
+	GF_M2TS_Mux *muxer = NULL;
 
 	/***********************/
 	/*   parse arguments   */
@@ -476,13 +441,13 @@ int main(int argc, char **argv)
 	/***************************/
 	/*   create mp42ts muxer   */
 	/***************************/
-	muxer = gf_m2ts_mux_new(0, psi_refresh_rate, 0);
+	muxer = gf_m2ts_mux_new(0, PSI_REFRESH_RATE, 0);
 	if (!muxer) {
 		fprintf(stderr, "Could not create the muxer. Aborting.\n");
 		goto exit;
 	}
 	gf_m2ts_mux_use_single_au_pes_mode(muxer, GF_M2TS_PACK_AUDIO_ONLY);
-	gf_m2ts_mux_set_pcr_max_interval(muxer, pcr_ms);
+	gf_m2ts_mux_set_pcr_max_interval(muxer, PCR_MS);
 
 	ts_output_file = gf_fopen(ts_out, "wb");
 	if (!ts_output_file) {
@@ -493,27 +458,18 @@ int main(int argc, char **argv)
 	/****************************************/
 	/*   declare all streams to the muxer   */
 	/****************************************/
-	cur_pid = 100;	/*PIDs start from 100*/
-
 	GF_M2TS_Mux_Program *program;
 
-	u32 prog_pcr_offset = 0;
-	fprintf(stderr, "Setting up program ID 1 - send rates: PSI %d ms PCR %d ms - PCR offset %d\n", psi_refresh_rate, pcr_ms, prog_pcr_offset);
+	fprintf(stderr, "Setting up program ID 1 - send rates: PSI %d ms PCR %d ms - PCR offset %d\n", PSI_REFRESH_RATE, PCR_MS, PROG_PCR_OFFSET);
 
-	program = gf_m2ts_mux_program_add(muxer, 1, cur_pid, psi_refresh_rate, prog_pcr_offset, GF_M2TS_MPEG4_SIGNALING_NONE);
+	program = gf_m2ts_mux_program_add(muxer, 1, STARTING_PID, PSI_REFRESH_RATE, PROG_PCR_OFFSET, GF_M2TS_MPEG4_SIGNALING_NONE);
 	if (program) {
 		for (j=0; j<source.nb_streams; j++) {
-			GF_M2TS_Mux_Stream *stream;
-			Bool force_pes_mode = 0;
 			/*likely an OD stream disabled*/
 			if (!source.streams[j].stream_type) continue;
 
-			stream = gf_m2ts_program_stream_add(program, &source.streams[j], cur_pid+j+1, (source.pcr_idx==j) ? 1 : 0, force_pes_mode);
-		}
-
-		cur_pid += source.nb_streams;
-		while (cur_pid % 10) {
-			cur_pid ++;
+			Bool force_pes_mode = 0;
+			gf_m2ts_program_stream_add(program, &source.streams[j], STARTING_PID+j+1, (source.pcr_idx==j) ? 1 : 0, force_pes_mode);
 		}
 	}
 
@@ -528,7 +484,7 @@ int main(int argc, char **argv)
 		u32 status;
 
 		/*flush all packets*/
-		while ((ts_pck = gf_m2ts_mux_process(muxer, &status, &usec_till_next)) != NULL) {
+		while ((ts_pck = gf_m2ts_mux_process(muxer, &status, NULL)) != NULL) {
 			if (ts_output_file != NULL) {
 				gf_fwrite(ts_pck, 1, 188, ts_output_file);
 			}
@@ -567,9 +523,6 @@ exit:
 		}
 		if (source.streams[j].decoder_config) {
 			gf_free(source.streams[j].decoder_config);
-		}
-		if (source.streams[j].sl_config) {
-			gf_free(source.streams[j].sl_config);
 		}
 	}
 	if (source.mp4) {

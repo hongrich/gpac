@@ -32,6 +32,10 @@
 #error "Cannot compile MP42TS if GPAC is not built with MPEG2-TS Muxing support"
 #endif
 
+#ifdef GPAC_DISABLE_ISOM
+#error "Cannot compile MP42TS if GPAC is not built with ISO File Format support"
+#endif
+
 static GFINLINE void usage()
 {
 	fprintf(stderr, "GPAC version " GPAC_FULL_VERSION "\n"
@@ -62,18 +66,13 @@ static GFINLINE void usage()
 
 typedef struct
 {
-
-#ifndef GPAC_DISABLE_ISOM
 	GF_ISOFile *mp4;
-#endif
-
 	u32 nb_streams, pcr_idx;
 	GF_ESInterface streams[40];
 	u64 samples_done, samples_count;
 	u32 nb_real_streams;
 } M2TSSource;
 
-#ifndef GPAC_DISABLE_ISOM
 typedef struct
 {
 	GF_ISOFile *mp4;
@@ -83,9 +82,6 @@ typedef struct
 	s64 ts_offset, cts_dts_shift;
 	M2TSSource *source;
 } GF_ESIMP4;
-#endif
-
-#ifndef GPAC_DISABLE_ISOM
 
 static GF_Err mp4_input_ctrl(GF_ESInterface *ifce, u32 act_type, void *param)
 {
@@ -277,8 +273,6 @@ static void fill_isom_es_ifce(M2TSSource *source, GF_ESInterface *ifce, GF_ISOFi
 	}
 }
 
-#endif //GPAC_DISABLE_ISOM
-
 static volatile Bool run = 1;
 
 static Bool open_source(M2TSSource *source, char *src)
@@ -286,7 +280,6 @@ static Bool open_source(M2TSSource *source, char *src)
 	memset(source, 0, sizeof(M2TSSource));
 
 	/*open ISO file*/
-#ifndef GPAC_DISABLE_ISOM
 	if (gf_isom_probe_file(src)) {
 		u32 i;
 		u32 nb_tracks;
@@ -371,18 +364,17 @@ static Bool open_source(M2TSSource *source, char *src)
 
 		return 1;
 	}
-#endif
 
-		{
-			FILE *f = gf_fopen(src, "rt");
-			if (f) {
-				gf_fclose(f);
-				fprintf(stderr, "Error opening %s - not a supported input media, skipping.\n", src);
-			} else {
-				fprintf(stderr, "Error opening %s - no such file.\n", src);
-			}
-			return 0;
+	{
+		FILE *f = gf_fopen(src, "rt");
+		if (f) {
+			gf_fclose(f);
+			fprintf(stderr, "Error opening %s - not a supported input media, skipping.\n", src);
+		} else {
+			fprintf(stderr, "Error opening %s - no such file.\n", src);
 		}
+		return 0;
+	}
 }
 
 /*macro to keep retro compatibility with '=' and spaces in parse_args*/
@@ -391,9 +383,9 @@ static Bool open_source(M2TSSource *source, char *src)
             || ((strlen(arg) == strlen(param)) && ++i && (i<argc) && (next_arg = argv[i]))))
 
 /*parse MP42TS arguments*/
-static GFINLINE GF_Err parse_args(int argc, char **argv, M2TSSource *source, char **ts_out)
+static GFINLINE GF_Err parse_args(int argc, char **argv, char **mp4_in, char **ts_out)
 {
-	Bool dst_found=0;
+	Bool input_found=0, dst_found=0;
 	char *arg = NULL, *next_arg = NULL, *error_msg = "no argument found";
 	s32 i;
 
@@ -414,35 +406,25 @@ static GFINLINE GF_Err parse_args(int argc, char **argv, M2TSSource *source, cha
 			goto error;
 		}
 	}
+	if (!dst_found) {
+		fprintf(stderr, "Error: Destination argument not found\n");
+		usage();
+		return GF_BAD_PARAM;
+	}
 
 	/*second pass: open sources*/
 	for (i=1; i<argc; i++) {
-		u32 res;
-		char *src_args;
 		arg = argv[i];
 		if (arg[0] !='-') continue;
 
 		if (! CHECK_PARAM("-src") && ! CHECK_PARAM("-prog") ) continue;
 
-		src_args = strchr(next_arg, ':');
-		if (src_args && (src_args[1]=='\\')) {
-			src_args = strchr(src_args+2, ':');
-		}
-		if (src_args) {
-			src_args[0] = 0;
-			src_args = src_args + 1;
-		}
-
-		res = open_source(source, next_arg);
-		if (res) {
-			return GF_OK;
-		}
-	}
-	/*syntax is correct; now testing the presence of mandatory arguments*/
-	if (dst_found) {
+		input_found = 1;
+		*mp4_in = gf_strdup(next_arg);
 		return GF_OK;
-	} else {
-		fprintf(stderr, "Error: Destination argument not found\n");
+	}
+	if (!input_found) {
+		fprintf(stderr, "Error: Source argument not found\n");
 		usage();
 		return GF_BAD_PARAM;
 	}
@@ -464,6 +446,7 @@ int main(int argc, char **argv)
 	const char *ts_pck;
 	u32 usec_till_next;
 	u32 j, cur_pid, psi_refresh_rate, pcr_ms;
+	char *mp4_in = NULL;
 	char *ts_out = NULL;
 	FILE *ts_output_file = NULL;
 	M2TSSource source;
@@ -472,6 +455,7 @@ int main(int argc, char **argv)
 	/***********************/
 	/*   initialisations   */
 	/***********************/
+	mp4_in = NULL;
 	ts_output_file = NULL;
 	ts_out = NULL;
 	pcr_ms = 100;
@@ -481,7 +465,11 @@ int main(int argc, char **argv)
 	/***********************/
 	/*   parse arguments   */
 	/***********************/
-	if (GF_OK != parse_args(argc, argv, &source, &ts_out)) {
+	if (GF_OK != parse_args(argc, argv, &mp4_in, &ts_out)) {
+		goto exit;
+	}
+
+	if (!open_source(&source, mp4_in)) {
 		goto exit;
 	}
 
@@ -496,12 +484,10 @@ int main(int argc, char **argv)
 	gf_m2ts_mux_use_single_au_pes_mode(muxer, GF_M2TS_PACK_AUDIO_ONLY);
 	gf_m2ts_mux_set_pcr_max_interval(muxer, pcr_ms);
 
-	if (ts_out != NULL) {
-		ts_output_file = gf_fopen(ts_out, "wb");
-		if (!ts_output_file) {
-			fprintf(stderr, "Error opening %s\n", ts_out);
-			goto exit;
-		}
+	ts_output_file = gf_fopen(ts_out, "wb");
+	if (!ts_output_file) {
+		fprintf(stderr, "Error opening %s\n", ts_out);
+		goto exit;
 	}
 
 	/****************************************/
@@ -567,6 +553,7 @@ int main(int argc, char **argv)
 
 exit:
 	run = 0;
+	if (mp4_in) gf_free(mp4_in);
 	if (ts_output_file) gf_fclose(ts_output_file);
 	if (ts_out) gf_free(ts_out);
 	if (muxer) gf_m2ts_mux_del(muxer);
@@ -585,11 +572,9 @@ exit:
 			gf_free(source.streams[j].sl_config);
 		}
 	}
-#ifndef GPAC_DISABLE_ISOM
 	if (source.mp4) {
 		gf_isom_close(source.mp4);
 	}
-#endif
 
 	return 0;
 }
